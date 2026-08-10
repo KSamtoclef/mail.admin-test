@@ -1,263 +1,174 @@
 /**
  * Cloudflare Worker — D1 Contacts API
  *
- * Secure API layer between the application and a Cloudflare D1 `contacts` table.
- * The Worker never exposes D1 credentials or the auth token to the browser.
+ * Secure API layer between the Mail Admin app and a Cloudflare D1 `contacts` table.
+ * The browser never talks to this Worker directly; the Supabase edge function
+ * `contacts-proxy` calls it using the WORKER_AUTH_TOKEN secret.
  *
- * Endpoints (all require Authorization: Bearer <WORKER_AUTH_TOKEN>):
- *   GET  /contacts/count      -> { total: number }
- *   POST /contacts/retrieve   -> { contacts: Contact[] }   body: { count: number }
- *   POST /contacts/import     -> { imported, skipped }      body: CSV text (text/csv)
+ * Endpoints (all require `Authorization: Bearer <WORKER_AUTH_TOKEN>`):
+ *   GET  /contacts/count       -> { total: number }
+ *   POST /contacts/retrieve    body: { count: number }  -> { contacts: Contact[] }
+ *   POST /contacts/import      multipart/form-data field "file" (CSV) -> { imported, skipped }
  *
- * D1 binding (wrangler.toml):
- *   [[d1_databases]]
- *   binding = "CONTACTS_DB"
- *   database_name = "contacts-db"
- *   database_id = "<your-d1-database-id>"
- *
- * Secret:
- *   wrangler secret put WORKER_AUTH_TOKEN
+ * D1 binding:  [[d1_databases]]  (see wrangler.toml)
+ * Secret:       WORKER_AUTH_TOKEN  (set via `wrangler secret put WORKER_AUTH_TOKEN`)
  */
-
-interface Contact {
-  id: number;
-  user_id: string | null;
-  session_id: string | null;
-  email: string;
-  full_name: string | null;
-  username: string | null;
-  country: string | null;
-}
-
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
-};
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const MAX_RETRIEVE = 50000;
-const IMPORT_BATCH = 500;
-
-export default {
-  async fetch(request, env) {
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders });
-    }
-
-    // Auth check — every request must carry the bearer token
-    const authError = checkAuth(request, env);
-    if (authError) return authError;
-
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    try {
-      if (path === "/contacts/count" && request.method === "GET") {
-        return await handleCount(env);
-      }
-      if (path === "/contacts/retrieve" && request.method === "POST") {
-        return await handleRetrieve(request, env);
-      }
-      if (path === "/contacts/import" && request.method === "POST") {
-        return await handleImport(request, env);
-      }
-      return json({ error: "Not found" }, 404);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Internal error";
-      return json({ error: message }, 500);
-    }
-  },
-};
-
-function checkAuth(request, env) {
-  const token = env.WORKER_AUTH_TOKEN;
-  if (!token) {
-    return json({ error: "Worker auth token not configured" }, 500);
-  }
-  const header = request.headers.get("Authorization") || "";
-  if (!header.startsWith("Bearer ")) {
-    return json({ error: "Missing or malformed Authorization header" }, 401);
-  }
-  if (header.slice(7) !== token) {
-    return json({ error: "Unauthorized" }, 401);
-  }
-  return null;
-}
-
-async function handleCount(env) {
-  const result = await env.CONTACTS_DB.prepare("SELECT COUNT(*) as total FROM contacts").first();
-  const total = result?.total ?? 0;
-  return json({ total });
-}
-
-async function handleRetrieve(request, env) {
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return json({ error: "Invalid JSON body" }, 400);
-  }
-
-  const count = Number(body?.count);
-  if (!Number.isFinite(count) || count <= 0) {
-    return json({ error: "count must be a positive number" }, 400);
-  }
-
-  const limit = Math.min(Math.floor(count), MAX_RETRIEVE);
-  const { results } = await env.CONTACTS_DB.prepare(
-    "SELECT id, user_id, session_id, email, full_name, username, country FROM contacts ORDER BY id ASC LIMIT ?"
-  ).bind(limit).all();
-
-  return json({ contacts: results || [] });
-}
-
-async function handleImport(request, env) {
-  const contentType = request.headers.get("Content-Type") || "";
-  let csvText;
-
-  if (contentType.includes("application/json")) {
-    // JSON envelope: { csv: "..." } — lets the proxy forward the file content
-    let body;
-    try {
-      body = await request.json();
-    } catch {
-      return json({ error: "Invalid JSON body" }, 400);
-    }
-    csvText = body?.csv;
-  } else {
-    csvText = await request.text();
-  }
-
-  if (!csvText || typeof csvText !== "string") {
-    return json({ error: "No CSV content received" }, 400);
-  }
-
-  const rows = parseCsv(csvText);
-  if (rows.length === 0) {
-    return json({ imported: 0, skipped: 0, error: "No data rows found in CSV" }, 400);
-  }
-
-  // Find column indices from header row (case-insensitive)
-  const header = rows[0].map((h) => h.trim().toLowerCase());
-  const findCol = (...names) => header.findIndex((h) => names.includes(h));
-  const col = {
-    email: findCol("email"),
-    full_name: findCol("full_name", "fullname", "full name"),
-    username: findCol("username"),
-    country: findCol("country"),
-    user_id: findCol("user_id"),
-    session_id: findCol("session_id"),
-  };
-
-  if (col.email === -1) {
-    return json({ error: "CSV must contain an 'Email' column" }, 400);
-  }
-
-  let imported = 0;
-  let skipped = 0;
-  const seen = new Set();
-
-  const stmt = env.CONTACTS_DB.prepare(
-    "INSERT OR IGNORE INTO contacts (user_id, session_id, email, full_name, username, country) VALUES (?, ?, ?, ?, ?, ?)"
-  );
-
-  // Process in batches via D1 batch API
-  for (let i = 1; i < rows.length; i += IMPORT_BATCH) {
-    const batchRows = rows.slice(i, i + IMPORT_BATCH);
-    const batch = [];
-
-    for (const row of batchRows) {
-      const emailRaw = (row[col.email] || "").trim().toLowerCase();
-      if (!emailRaw || !EMAIL_REGEX.test(emailRaw) || seen.has(emailRaw)) {
-        skipped++;
-        continue;
-      }
-      seen.add(emailRaw);
-
-      const username = col.username !== -1 ? (row[col.username] || "").trim() : "";
-      const full_name_raw = col.full_name !== -1 ? (row[col.full_name] || "").trim() : "";
-      const full_name = full_name_raw || username || null;
-      const country_raw = col.country !== -1 ? (row[col.country] || "").trim() : "";
-      const country = country_raw || "Nigeria";
-      const user_id = col.user_id !== -1 ? (row[col.user_id] || "").trim() || null : null;
-      const session_id = col.session_id !== -1 ? (row[col.session_id] || "").trim() || null : null;
-
-      batch.push(stmt.bind(user_id, session_id, emailRaw, full_name, username || null, country));
-    }
-
-    if (batch.length > 0) {
-      const results = await env.CONTACTS_DB.batch(batch);
-      for (const r of results) {
-        if (r.meta?.changes && r.meta.changes > 0) imported++;
-        else skipped++;
-      }
-    }
-  }
-
-  return json({ imported, skipped });
-}
-
-/**
- * Minimal RFC-4180-ish CSV parser supporting quoted fields with commas
- * and doubled quotes inside quoted fields.
- */
-function parseCsv(text) {
-  const rows = [];
-  let row = [];
-  let field = "";
-  let inQuotes = false;
-
-  for (let i = 0; i < text.length; i++) {
-    const char = text[i];
-    const next = text[i + 1];
-
-    if (inQuotes) {
-      if (char === '"') {
-        if (next === '"') {
-          field += '"';
-          i++;
-        } else {
-          inQuotes = false;
-        }
-      } else {
-        field += char;
-      }
-    } else {
-      if (char === '"') {
-        inQuotes = true;
-      } else if (char === ",") {
-        row.push(field);
-        field = "";
-      } else if (char === "\n") {
-        row.push(field);
-        rows.push(row);
-        row = [];
-        field = "";
-      } else if (char === "\r") {
-        // skip — handled by \n
-      } else {
-        field += char;
-      }
-    }
-  }
-  // last field/row
-  if (field.length > 0 || row.length > 0) {
-    row.push(field);
-    rows.push(row);
-  }
-
-  // Drop trailing empty rows
-  while (rows.length && rows[rows.length - 1].length === 1 && rows[rows.length - 1][0] === "") {
-    rows.pop();
-  }
-
-  return rows;
-}
+const CSV_BATCH_SIZE = 50;
 
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    },
   });
 }
+
+function parseCSV(text) {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim() !== '');
+  if (lines.length === 0) return [];
+
+  const header = lines[0].split(',').map((h) => h.trim().toLowerCase());
+  const findCol = (...names) => header.findIndex((h) => names.includes(h));
+
+  const emailIdx = findCol('email');
+  const fullNameIdx = findCol('fullname', 'full_name', 'full name');
+  const usernameIdx = findCol('username');
+  const countryIdx = findCol('country');
+  const userIdIdx = findCol('user_id');
+  const sessionIdIdx = findCol('session_id');
+
+  if (emailIdx === -1) {
+    throw new Error('CSV must contain an "Email" column');
+  }
+
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cells = lines[i].split(',');
+    const username = usernameIdx >= 0 ? (cells[usernameIdx] || '').trim() : '';
+    const fullNameRaw = fullNameIdx >= 0 ? (cells[fullNameIdx] || '').trim() : '';
+    const countryRaw = countryIdx >= 0 ? (cells[countryIdx] || '').trim() : '';
+
+    rows.push({
+      email: (cells[emailIdx] || '').trim(),
+      full_name: fullNameRaw || username,
+      username,
+      country: countryRaw || 'Nigeria',
+      user_id: userIdIdx >= 0 ? (cells[userIdIdx] || '').trim() : '',
+      session_id: sessionIdIdx >= 0 ? (cells[sessionIdIdx] || '').trim() : '',
+    });
+  }
+  return rows;
+}
+
+export default {
+  async fetch(request, env) {
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        },
+      });
+    }
+
+    const header = request.headers.get('Authorization') || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+    if (token === '' || token !== (env.WORKER_AUTH_TOKEN || '')) {
+      return json({ error: 'Unauthorized' }, 401);
+    }
+
+    const db = env.DB;
+    if (!db) {
+      return json({ error: 'D1 database binding "DB" is not configured' }, 500);
+    }
+
+    const url = new URL(request.url);
+    const path = url.pathname.replace(/\/$/, '');
+
+    try {
+      if (path === '/contacts/count' && request.method === 'GET') {
+        const result = await db.prepare('SELECT COUNT(*) as total FROM contacts').first();
+        return json({ total: result?.total ?? 0 });
+      }
+
+      if (path === '/contacts/retrieve' && request.method === 'POST') {
+        let count;
+        try {
+          const body = await request.json();
+          count = Number(body.count);
+        } catch {
+          return json({ error: 'Invalid JSON body' }, 400);
+        }
+        if (!Number.isFinite(count) || count < 1) {
+          return json({ error: 'count must be a positive integer' }, 400);
+        }
+        count = Math.min(Math.floor(count), 50000);
+
+        const contacts = await db
+          .prepare('SELECT id, user_id, session_id, email, full_name, username, country FROM contacts LIMIT ?')
+          .bind(count)
+          .all();
+        return json({ contacts: contacts.results || [] });
+      }
+
+      if (path === '/contacts/import' && request.method === 'POST') {
+        const formData = await request.formData();
+        const file = formData.get('file');
+        if (!file || typeof file.text !== 'function') {
+          return json({ error: 'CSV file is required (field "file")' }, 400);
+        }
+
+        const text = await file.text();
+        let rows;
+        try {
+          rows = parseCSV(text);
+        } catch (err) {
+          return json({ error: err.message }, 400);
+        }
+
+        let imported = 0;
+        let skipped = 0;
+
+        for (let i = 0; i < rows.length; i += CSV_BATCH_SIZE) {
+          const batch = rows.slice(i, i + CSV_BATCH_SIZE);
+          const stmts = [];
+
+          for (const row of batch) {
+            const email = row.email.toLowerCase();
+            if (!EMAIL_REGEX.test(email)) {
+              skipped++;
+              continue;
+            }
+            stmts.push(
+              db
+                .prepare('INSERT OR IGNORE INTO contacts (user_id, session_id, email, full_name, username, country) VALUES (?, ?, ?, ?, ?, ?)')
+                .bind(row.user_id || null, row.session_id || null, email, row.full_name || null, row.username || null, row.country)
+            );
+          }
+
+          if (stmts.length === 0) continue;
+
+          const results = await db.batch(stmts);
+          for (const r of results) {
+            if (r.meta && r.meta.changes > 0) imported++;
+            else skipped++;
+          }
+        }
+
+        return json({ imported, skipped });
+      }
+
+      return json({ error: 'Not found' }, 404);
+    } catch (err) {
+      return json({ error: err instanceof Error ? err.message : 'Internal error' }, 500);
+    }
+  },
+};

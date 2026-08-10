@@ -1,0 +1,22 @@
+# Cloudflare Worker configuration for the D1 Contacts API.
+#
+# 1. Deploy the Worker:
+#      wrangler deploy
+#
+# 2. Set the auth token secret (do NOT commit the real value):
+#      wrangler secret put WORKER_AUTH_TOKEN
+#
+# 3. Update `d1_databases.database_name` / `database_id` to match your D1 database.
+#    Find the database id with:  wrangler d1 list
+#
+# The Worker expects a `contacts` table in the bound D1 database with columns:
+#   id, email (UNIQUE), full_name, username, country
+
+name = "contacts-worker"
+main = "contacts-worker.js"
+compatibility_date = "2024-09-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "contacts_db"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"

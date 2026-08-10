@@ -1,5 +1,5 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { createClient } from "jsr:@supabase/supabase-js@2";
+import { requireAdmin } from "../_shared/admin-auth.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -11,12 +11,6 @@ const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY") ?? "";
 const DEFAULT_FROM_EMAIL = Deno.env.get("DEFAULT_FROM_EMAIL") ?? "";
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-function extractEmailAddress(value: string): string | null {
-  if (!value || !value.trim()) return null;
-  const match = value.match(/<([^>]+)>/);
-  return match ? match[1] : value.trim();
-}
 
 function isValidFromFormat(value: string): boolean {
   if (!value || !value.trim()) return false;
@@ -40,6 +34,10 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
+    const auth = await requireAdmin(req);
+    if (!auth.ok) return withCors(auth.response);
+    const supabase = auth.supabase;
+
     const { to, subject, html, senderName, senderEmail, testRecordId } = await req.json();
 
     if (!to || !subject || !html) {
@@ -50,7 +48,6 @@ Deno.serve(async (req: Request) => {
       return jsonResponse({ error: "RESEND_API_KEY is not configured. Add it as an edge function secret." }, 500);
     }
 
-    // Fetch verified domains from Resend to validate the sender domain
     let verifiedDomains: string[] = [];
     try {
       const domainsResponse = await fetch("https://api.resend.com/domains", {
@@ -63,10 +60,9 @@ Deno.serve(async (req: Request) => {
           .map((d: { name: string }) => d.name.toLowerCase());
       }
     } catch {
-      // If we can't fetch domains, we'll rely on Resend's own validation
+      // Resend will still validate the sender when the message is submitted.
     }
 
-    // Determine the sender address
     let fromAddress: string | null = null;
 
     if (senderEmail && senderEmail.trim()) {
@@ -103,7 +99,6 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    // Final safety check — never send a malformed from field to Resend
     if (!isValidFromFormat(fromAddress)) {
       return jsonResponse(
         { error: `Resolved sender address is malformed: "${fromAddress}". Check DEFAULT_FROM_EMAIL secret and sender input.` },
@@ -127,10 +122,6 @@ Deno.serve(async (req: Request) => {
       const errorDetails = data.name ? `${data.name}: ${errorMessage}` : errorMessage;
 
       if (testRecordId) {
-        const supabase = createClient(
-          Deno.env.get("SUPABASE_URL") ?? "",
-          Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
-        );
         await supabase
           .from("test_email_records")
           .update({ status: "failed", error_info: errorDetails })
@@ -141,10 +132,6 @@ Deno.serve(async (req: Request) => {
     }
 
     if (testRecordId) {
-      const supabase = createClient(
-        Deno.env.get("SUPABASE_URL") ?? "",
-        Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
-      );
       await supabase
         .from("test_email_records")
         .update({ status: "sent", result: `Sent successfully. Message ID: ${data.id}` })
@@ -163,4 +150,10 @@ function jsonResponse(body: unknown, status = 200) {
     status,
     headers: { ...corsHeaders, "Content-Type": "application/json" },
   });
+}
+
+function withCors(response: Response) {
+  const headers = new Headers(response.headers);
+  Object.entries(corsHeaders).forEach(([key, value]) => headers.set(key, value));
+  return new Response(response.body, { status: response.status, headers });
 }

@@ -65,7 +65,8 @@ export async function fetchTrendData(days = 30): Promise<DailyTrend[]> {
   if (error) throw new Error(error.message);
   if (data?.error) throw new Error(data.error);
 
-  return (data?.trends ?? []) as DailyTrend[];
+  const trends = (data?.trends ?? []) as DailyTrend[];
+  return trends.slice(-Math.max(1, days));
 }
 
 // ─── Activity Log ──────────────────────────────────────────────────
@@ -397,7 +398,7 @@ export async function fetchRecipients(page = 1, pageSize = 50, search?: string) 
 }
 
 export async function fetchRecipientEmails(audienceType: string, segmentIds: string[]) {
-  let query = supabase.from('recipients').select('email').eq('status', 'active');
+  const query = supabase.from('recipients').select('email').eq('status', 'active');
   if (audienceType === 'segment' && segmentIds.length > 0) {
     // For segments, we need to resolve segment rules. For now, fetch all active
     // and let the edge function apply segment filtering.

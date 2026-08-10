@@ -31,6 +31,10 @@ Dashboard routes use Supabase Auth. A signed-in user must also have a matching r
 
 Run migrations in filename order. The compatibility migration preserves the old Mail Admin tables where schemas conflict, and the final legacy-contact migration copies the existing contact audience into the rebuilt `recipients` model without deleting the historical `contacts` table.
 
+## Verification
+
+Every production build runs `npm run validate` first. GitHub Actions also installs dependencies, validates source/backend contracts, runs the TypeScript compiler, lints the repository, and performs a clean Vite production build.
+
 ## Deployment
 
 - Frontend: Vercel/Vite

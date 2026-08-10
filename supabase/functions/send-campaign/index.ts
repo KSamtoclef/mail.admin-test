@@ -1,5 +1,5 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { createClient } from "jsr:@supabase/supabase-js@2";
+import { requireAdmin } from "../_shared/admin-auth.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -32,17 +32,15 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
+    const auth = await requireAdmin(req);
+    if (!auth.ok) return withCors(auth.response);
+    const supabase = auth.supabase;
+
     const { campaignId, contactCount } = await req.json();
     if (!campaignId) {
       return jsonResponse({ error: "campaignId is required" }, 400);
     }
 
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL") ?? "",
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
-    );
-
-    // Fetch campaign
     const { data: campaign, error: cErr } = await supabase
       .from("campaigns")
       .select("*")
@@ -52,7 +50,6 @@ Deno.serve(async (req: Request) => {
       return jsonResponse({ error: "Campaign not found" }, 404);
     }
 
-    // Validate sender address before sending anything
     const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!campaign.sender_email || !EMAIL_REGEX.test(campaign.sender_email.trim())) {
       return jsonResponse(
@@ -65,9 +62,6 @@ Deno.serve(async (req: Request) => {
       ? `${campaign.sender_name.trim()} <${campaign.sender_email.trim()}>`
       : campaign.sender_email.trim();
 
-    // ── Build the recipient list ─────────────────────────────────
-    // For d1_contacts audience, fetch from the Cloudflare D1 Worker.
-    // Otherwise fall back to the existing Supabase recipients table.
     let allContacts: RecipientContact[];
     let requestedCount: number | null;
 
@@ -79,7 +73,6 @@ Deno.serve(async (req: Request) => {
           : null);
       allContacts = await fetchD1Contacts(requestedCount);
     } else {
-      // Existing Supabase recipients path — leave D1 untouched
       const { data: recipients, error: rErr } = await supabase
         .from("recipients")
         .select("email, full_name, username, country")
@@ -97,19 +90,16 @@ Deno.serve(async (req: Request) => {
       return jsonResponse({ error: "No contacts available" }, 400);
     }
 
-    // Fetch suppression list
     const { data: suppressed } = await supabase
       .from("suppression_list")
       .select("email");
     const suppressedSet = new Set((suppressed || []).map((s: { email: string }) => s.email.toLowerCase()));
 
-    // Filter out suppressed emails
     const eligibleContacts = allContacts.filter(
       (c: RecipientContact) => !suppressedSet.has(c.email.toLowerCase())
     );
     const suppressedCount = allContacts.length - eligibleContacts.length;
 
-    // Update campaign with counts and status
     await supabase
       .from("campaigns")
       .update({
@@ -124,11 +114,8 @@ Deno.serve(async (req: Request) => {
     let sentCount = 0;
     let failedCount = 0;
 
-    // Process in batches
     for (let i = 0; i < eligibleContacts.length; i += batchSize) {
       const batch = eligibleContacts.slice(i, i + batchSize);
-
-      // Insert batch into campaign_recipients
       const recipientRecords = batch.map((c: RecipientContact) => ({
         campaign_id: campaignId,
         email: c.email,
@@ -141,17 +128,14 @@ Deno.serve(async (req: Request) => {
         .select("id, email");
 
       if (!inserted) continue;
-
-      // Map inserted records back to their contact for personalization
       const contactMap = new Map(batch.map((c: RecipientContact) => [c.email.toLowerCase(), c]));
 
-      // Send each email via Resend
       for (const recipient of inserted) {
         try {
           const contact = contactMap.get(recipient.email.toLowerCase());
           const personalization: Record<string, string> = {};
-
           let htmlContent = campaign.html_content;
+
           if (contact) {
             if (contact.full_name) {
               personalization["FullName"] = contact.full_name;
@@ -171,7 +155,6 @@ Deno.serve(async (req: Request) => {
             }
           }
 
-          // Send via Resend API
           const sendResult = await sendViaResend({
             to: recipient.email,
             subject: campaign.subject,
@@ -199,15 +182,11 @@ Deno.serve(async (req: Request) => {
               provider_message_id: sendResult.messageId,
               sent_at: new Date().toISOString(),
             });
-
             sentCount++;
           } else {
             await supabase
               .from("campaign_recipients")
-              .update({
-                status: "failed",
-                error_info: sendResult.error,
-              })
+              .update({ status: "failed", error_info: sendResult.error })
               .eq("id", recipient.id);
 
             await supabase.from("email_activity").insert({
@@ -226,7 +205,6 @@ Deno.serve(async (req: Request) => {
               campaign_name: campaign.name,
               provider_response: sendResult.error || "",
             });
-
             failedCount++;
           }
         } catch (err) {
@@ -235,22 +213,16 @@ Deno.serve(async (req: Request) => {
             .from("campaign_recipients")
             .update({ status: "failed", error_info: errorMsg })
             .eq("id", recipient.id);
-
           failedCount++;
         }
       }
 
-      // Update campaign stats after each batch
       await supabase
         .from("campaigns")
-        .update({
-          sent_count: sentCount,
-          failed_count: failedCount,
-        })
+        .update({ sent_count: sentCount, failed_count: failedCount })
         .eq("id", campaignId);
     }
 
-    // Mark campaign as completed
     await supabase
       .from("campaigns")
       .update({
@@ -343,13 +315,17 @@ async function sendViaResend(params: {
     });
 
     const data = await response.json();
-
     if (!response.ok) {
       return { success: false, error: data.message || `Resend API error: ${response.status}` };
     }
-
     return { success: true, messageId: data.id };
   } catch (err) {
     return { success: false, error: err instanceof Error ? err.message : "Resend API error" };
   }
+}
+
+function withCors(response: Response) {
+  const headers = new Headers(response.headers);
+  Object.entries(corsHeaders).forEach(([key, value]) => headers.set(key, value));
+  return new Response(response.body, { status: response.status, headers });
 }

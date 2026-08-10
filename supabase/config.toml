@@ -1,0 +1,21 @@
+[functions.send-campaign]
+verify_jwt = true
+
+[functions.send-test-email]
+verify_jwt = true
+
+[functions.test-provider]
+verify_jwt = true
+
+[functions.resend-analytics]
+verify_jwt = true
+
+[functions.resend-domains]
+verify_jwt = true
+
+[functions.contacts-proxy]
+verify_jwt = true
+
+# Resend signs this endpoint with Svix headers instead of a Supabase user JWT.
+[functions.resend-webhook]
+verify_jwt = false

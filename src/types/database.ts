@@ -15,6 +15,7 @@ export interface Recipient {
   id: string;
   email: string;
   full_name: string | null;
+  username: string | null;
   country: string | null;
   status: string;
   metadata: Record<string, unknown>;
@@ -96,7 +97,6 @@ export interface Campaign {
   clicked_count: number;
   bounced_count: number;
   complained_count: number;
-  contact_count: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -106,7 +106,10 @@ export type CampaignRecipientStatus =
   | 'sent'
   | 'failed'
   | 'suppressed'
-  | 'skipped';
+  | 'skipped'
+  | 'delivered'
+  | 'bounced'
+  | 'complained';
 
 export interface CampaignRecipient {
   id: string;

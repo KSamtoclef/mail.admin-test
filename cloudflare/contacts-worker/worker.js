@@ -12,22 +12,12 @@
  * D1 binding (wrangler.toml):
  *   [[d1_databases]]
  *   binding = "CONTACTS_DB"
- *   database_name = "contacts-db"
+ *   database_name = "email_contacts"
  *   database_id = "<your-d1-database-id>"
  *
  * Secret:
  *   wrangler secret put WORKER_AUTH_TOKEN
  */
-
-interface Contact {
-  id: number;
-  user_id: string | null;
-  session_id: string | null;
-  email: string;
-  full_name: string | null;
-  username: string | null;
-  country: string | null;
-}
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -45,7 +35,6 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
 
-    // Auth check — every request must carry the bearer token
     const authError = checkAuth(request, env);
     if (authError) return authError;
 
@@ -117,7 +106,6 @@ async function handleImport(request, env) {
   let csvText;
 
   if (contentType.includes("application/json")) {
-    // JSON envelope: { csv: "..." } — lets the proxy forward the file content
     let body;
     try {
       body = await request.json();
@@ -138,7 +126,6 @@ async function handleImport(request, env) {
     return json({ imported: 0, skipped: 0, error: "No data rows found in CSV" }, 400);
   }
 
-  // Find column indices from header row (case-insensitive)
   const header = rows[0].map((h) => h.trim().toLowerCase());
   const findCol = (...names) => header.findIndex((h) => names.includes(h));
   const col = {
@@ -162,7 +149,6 @@ async function handleImport(request, env) {
     "INSERT OR IGNORE INTO contacts (user_id, session_id, email, full_name, username, country) VALUES (?, ?, ?, ?, ?, ?)"
   );
 
-  // Process in batches via D1 batch API
   for (let i = 1; i < rows.length; i += IMPORT_BATCH) {
     const batchRows = rows.slice(i, i + IMPORT_BATCH);
     const batch = [];
@@ -176,20 +162,20 @@ async function handleImport(request, env) {
       seen.add(emailRaw);
 
       const username = col.username !== -1 ? (row[col.username] || "").trim() : "";
-      const full_name_raw = col.full_name !== -1 ? (row[col.full_name] || "").trim() : "";
-      const full_name = full_name_raw || username || null;
-      const country_raw = col.country !== -1 ? (row[col.country] || "").trim() : "";
-      const country = country_raw || "Nigeria";
-      const user_id = col.user_id !== -1 ? (row[col.user_id] || "").trim() || null : null;
-      const session_id = col.session_id !== -1 ? (row[col.session_id] || "").trim() || null : null;
+      const fullNameRaw = col.full_name !== -1 ? (row[col.full_name] || "").trim() : "";
+      const fullName = fullNameRaw || username || null;
+      const countryRaw = col.country !== -1 ? (row[col.country] || "").trim() : "";
+      const country = countryRaw || "Nigeria";
+      const userId = col.user_id !== -1 ? (row[col.user_id] || "").trim() || null : null;
+      const sessionId = col.session_id !== -1 ? (row[col.session_id] || "").trim() || null : null;
 
-      batch.push(stmt.bind(user_id, session_id, emailRaw, full_name, username || null, country));
+      batch.push(stmt.bind(userId, sessionId, emailRaw, fullName, username || null, country));
     }
 
     if (batch.length > 0) {
       const results = await env.CONTACTS_DB.batch(batch);
-      for (const r of results) {
-        if (r.meta?.changes && r.meta.changes > 0) imported++;
+      for (const result of results) {
+        if (result.meta?.changes && result.meta.changes > 0) imported++;
         else skipped++;
       }
     }
@@ -198,10 +184,6 @@ async function handleImport(request, env) {
   return json({ imported, skipped });
 }
 
-/**
- * Minimal RFC-4180-ish CSV parser supporting quoted fields with commas
- * and doubled quotes inside quoted fields.
- */
 function parseCsv(text) {
   const rows = [];
   let row = [];
@@ -223,31 +205,26 @@ function parseCsv(text) {
       } else {
         field += char;
       }
-    } else {
-      if (char === '"') {
-        inQuotes = true;
-      } else if (char === ",") {
-        row.push(field);
-        field = "";
-      } else if (char === "\n") {
-        row.push(field);
-        rows.push(row);
-        row = [];
-        field = "";
-      } else if (char === "\r") {
-        // skip — handled by \n
-      } else {
-        field += char;
-      }
+    } else if (char === '"') {
+      inQuotes = true;
+    } else if (char === ",") {
+      row.push(field);
+      field = "";
+    } else if (char === "\n") {
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+    } else if (char !== "\r") {
+      field += char;
     }
   }
-  // last field/row
+
   if (field.length > 0 || row.length > 0) {
     row.push(field);
     rows.push(row);
   }
 
-  // Drop trailing empty rows
   while (rows.length && rows[rows.length - 1].length === 1 && rows[rows.length - 1][0] === "") {
     rows.pop();
   }

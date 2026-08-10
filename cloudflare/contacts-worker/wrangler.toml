@@ -2,9 +2,8 @@ name = "contacts-worker"
 main = "worker.js"
 compatibility_date = "2024-09-01"
 
-# D1 database binding — replace <your-d1-database-id> with your actual database ID.
-# Create one with: wrangler d1 create contacts-db
+# D1 database binding used by worker.js.
 [[d1_databases]]
-binding = "DB"
+binding = "CONTACTS_DB"
 database_name = "email_contacts"
 database_id = "440c1e85-52fa-4e73-a165-e3d6f0ce16e3"

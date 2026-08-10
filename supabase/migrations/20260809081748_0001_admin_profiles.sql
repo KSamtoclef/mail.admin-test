@@ -9,8 +9,7 @@
 
 3. Security
 - RLS enabled on admin_profiles.
-- All policies scoped TO authenticated, gated by user_id matching the current user.
-- SELECT/INSERT/UPDATE/DELETE policies.
+- Admin membership is provisioned server-side; signed-in users cannot self-promote.
 */
 
 CREATE OR REPLACE FUNCTION public.set_updated_at()
@@ -39,23 +38,17 @@ ALTER TABLE public.admin_profiles ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "admin_select_profiles" ON public.admin_profiles;
 CREATE POLICY "admin_select_profiles" ON public.admin_profiles
   FOR SELECT TO authenticated
-  USING (EXISTS (SELECT 1 FROM public.admin_profiles ap WHERE ap.user_id = auth.uid()));
+  USING (user_id = auth.uid());
 
 DROP POLICY IF EXISTS "admin_insert_profiles" ON public.admin_profiles;
-CREATE POLICY "admin_insert_profiles" ON public.admin_profiles
-  FOR INSERT TO authenticated
-  WITH CHECK (EXISTS (SELECT 1 FROM public.admin_profiles ap WHERE ap.user_id = auth.uid()));
 
 DROP POLICY IF EXISTS "admin_update_profiles" ON public.admin_profiles;
 CREATE POLICY "admin_update_profiles" ON public.admin_profiles
   FOR UPDATE TO authenticated
-  USING (EXISTS (SELECT 1 FROM public.admin_profiles ap WHERE ap.user_id = auth.uid()))
-  WITH CHECK (EXISTS (SELECT 1 FROM public.admin_profiles ap WHERE ap.user_id = auth.uid()));
+  USING (user_id = auth.uid())
+  WITH CHECK (user_id = auth.uid());
 
 DROP POLICY IF EXISTS "admin_delete_profiles" ON public.admin_profiles;
-CREATE POLICY "admin_delete_profiles" ON public.admin_profiles
-  FOR DELETE TO authenticated
-  USING (EXISTS (SELECT 1 FROM public.admin_profiles ap WHERE ap.user_id = auth.uid()));
 
 CREATE TRIGGER set_updated_at_admin_profiles
   BEFORE UPDATE ON public.admin_profiles

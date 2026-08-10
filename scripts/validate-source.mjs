@@ -90,6 +90,7 @@ function walk(dir) {
       else walk(absolute);
       continue;
     }
+    if (relative === 'scripts/validate-source.mjs') continue;
     if (!/\.(?:ts|tsx|js|mjs|json|sql|md|html|toml|example|gitignore)$/i.test(entry.name) && !['.env.example', '.gitignore'].includes(entry.name)) continue;
     const text = fs.readFileSync(absolute, 'utf8');
     for (const token of forbidden) if (text.includes(token)) failures.push(`Forbidden production token '${token}' found in ${relative}.`);

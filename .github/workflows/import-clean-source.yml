@@ -1,0 +1,43 @@
+name: Import cleaned Mail Admin source
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/import-clean-source.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  import-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate staged source archive
+        run: unzip -t .bootstrap/source.zip
+
+      - name: Extract audited source
+        run: |
+          unzip -oq .bootstrap/source.zip -d .
+          rm -rf .bootstrap
+          rm -f .github/workflows/import-clean-source.yml
+          rm -f .env
+          rm -rf .bolt cloudflare-worker node_modules dist
+
+      - name: Refuse secret files
+        run: |
+          test ! -f .env
+          ! git ls-files --others --exclude-standard | grep -E '(^|/)\.env($|\.)' || exit 1
+
+      - name: Commit imported source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Import audited Mail Admin rebuild"
+          git push

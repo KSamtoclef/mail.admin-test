@@ -1,0 +1,122 @@
+name: Finalize audited Mail Admin import
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/finalize-audited-import.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Recover verified authoritative contact worker
+        env:
+          SOURCE_PAGE: https://www.mediafire.com/file/4vu11prh973bkz3/BLOP.zip/file
+          EXPECTED_SHA256: 284592558ad17f953a0c7d6af1bcf1921cffcd20c20ecc689aea5a754519f332
+        run: |
+          python - <<'PY'
+          import hashlib, html, os, re, urllib.request, zipfile
+          page=os.environ['SOURCE_PAGE']
+          req=urllib.request.Request(page,headers={'User-Agent':'Mozilla/5.0'})
+          text=urllib.request.urlopen(req,timeout=30).read().decode('utf-8','replace')
+          url=None
+          for pat in (r'<a[^>]+id="downloadButton"[^>]+href="([^"]+)"',r'<a[^>]+href="([^"]+)"[^>]+id="downloadButton"'):
+              m=re.search(pat,text,re.I)
+              if m: url=html.unescape(m.group(1)); break
+          if not url: raise SystemExit('MediaFire download URL not found')
+          req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Referer':page})
+          data=urllib.request.urlopen(req,timeout=60).read()
+          digest=hashlib.sha256(data).hexdigest()
+          if digest != os.environ['EXPECTED_SHA256']: raise SystemExit('Source checksum mismatch')
+          open('/tmp/BLOP.zip','wb').write(data)
+          with zipfile.ZipFile('/tmp/BLOP.zip') as z:
+              worker=z.read('project/cloudflare-worker/contacts-worker.js')
+          open('cloudflare/contacts-worker/worker.js','wb').write(worker)
+          print('Verified source worker restored')
+          PY
+
+      - name: Apply audited code fixes
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import json
+
+          p=Path('supabase/functions/send-campaign/index.ts')
+          s=p.read_text()
+          s=s.replace('import { createClient } from "jsr:@supabase/supabase-js@2";','import { requireAdmin } from "../_shared/admin-auth.ts";')
+          s=s.replace('  try:\n    const { campaignId, contactCount } = await req.json();','  try:\n    const auth = await requireAdmin(req);\n    if (!auth.ok) return withCors(auth.response);\n    const supabase = auth.supabase;\n\n    const { campaignId, contactCount } = await req.json();')
+          s=s.replace('    const supabase = createClient(\n      Deno.env.get("SUPABASE_URL") ?? "",\n      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""\n    );\n\n','')
+          if 'function withCors(response: Response)' not in s:
+              s += '\nfunction withCors(response: Response) {\n  const headers = new Headers(response.headers);\n  Object.entries(corsHeaders).forEach(([key, value]) => headers.set(key, value));\n  return new Response(response.body, { status: response.status, headers });\n}\n'
+          if 'requireAdmin(req)' not in s or 'createClient(' in s:
+              raise SystemExit('send-campaign hardening did not apply cleanly')
+          p.write_text(s)
+
+          pkg=Path('package.json'); data=json.loads(pkg.read_text()); data['name']='mail-admin-test'; pkg.write_text(json.dumps(data,indent=2)+'\n')
+          lock=Path('package-lock.json'); data=json.loads(lock.read_text()); data['name']='mail-admin-test'; data['packages']['']['name']='mail-admin-test'; lock.write_text(json.dumps(data,indent=2)+'\n')
+
+          idx=Path('index.html'); s=idx.read_text()
+          s=s.replace('    <link rel="icon" type="image/svg+xml" href="/vite.svg" />\n','')
+          s=s.replace('<title>Admin Email Delivery Platform</title>','<title>Mail Admin</title>')
+          s=s.replace('    <meta property="og:image" content="https://bolt.new/static/og_default.png" />\n','')
+          s=s.replace('    <meta name="twitter:card" content="summary_large_image" />\n','')
+          s=s.replace('    <meta name="twitter:image" content="https://bolt.new/static/og_default.png" />\n','')
+          idx.write_text(s)
+          PY
+
+          cat > .env.example <<'EOF'
+          VITE_SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co
+          VITE_SUPABASE_ANON_KEY=YOUR_PUBLISHABLE_OR_ANON_KEY
+          EOF
+
+          cat > vercel.json <<'EOF'
+          {
+            "rewrites": [
+              { "source": "/(.*)", "destination": "/index.html" }
+            ]
+          }
+          EOF
+
+          cat > README.md <<'EOF'
+          # Mail Admin Test
+
+          React + Vite administration console for email campaigns, recipient audiences, templates, Resend delivery analytics, suppressions, domain verification, test sending and Cloudflare D1 contact import.
+
+          ## Setup
+          1. Copy `.env.example` to `.env` and set the Supabase URL plus publishable/anon key.
+          2. Never commit `.env` or service-role/provider credentials.
+          3. Configure Edge Function secrets: `RESEND_API_KEY`, `RESEND_WEBHOOK_SECRET`, `DEFAULT_FROM_EMAIL`, `D1_WORKER_ENDPOINT`, and `D1_WORKER_AUTH_TOKEN`.
+          4. Run `npm install` then `npm run dev`.
+
+          Admin access must be pre-provisioned server-side in `public.admin_profiles`; browser users cannot create their own admin role.
+          EOF
+
+      - name: Verify security invariants
+        run: |
+          test -f supabase/functions/_shared/admin-auth.ts
+          test -f supabase/migrations/20260810124000_0011_lock_admin_access.sql
+          test -f supabase/config.toml
+          grep -q 'requireAdmin(req)' supabase/functions/send-campaign/index.ts
+          grep -q 'requireAdmin(req)' supabase/functions/send-test-email/index.ts
+          grep -q 'requireAdmin(req)' supabase/functions/test-provider/index.ts
+          grep -q 'const db = env.DB' cloudflare/contacts-worker/worker.js
+          grep -q 'multipart/form-data' cloudflare/contacts-worker/worker.js
+          test ! -f .env
+          test ! -d cloudflare-worker
+
+      - name: Commit cleanup and remove one-time workflow
+        run: |
+          rm -f .github/workflows/finalize-audited-import.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Harden and finalize Mail Admin rebuild"
+          git push

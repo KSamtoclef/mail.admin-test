@@ -353,7 +353,7 @@ export async function fetchSuppression(reason?: string, search?: string) {
 export async function addSuppression(record: { email: string; reason: string; source?: string; notes?: string }) {
   const { data, error } = await supabase
     .from('suppression_list')
-    .insert({ ...record, source: record.source || 'manual' })
+    .insert({ ...record, email: record.email.trim().toLowerCase(), source: record.source || 'manual' })
     .select()
     .single();
   if (error) throw error;
@@ -433,50 +433,36 @@ export async function updateProviderSettings(id: string, updates: Partial<Provid
 // ─── Domain Auth (Resend-backed) ────────────────────────────────────
 
 export async function fetchResendDomains(): Promise<ResendDomain[]> {
-  const { data, error } = await supabase.functions.invoke('resend-domains?action=list', {
-    method: 'GET',
-    headers: { 'Content-Type': 'application/json' },
+  const { data, error } = await supabase.functions.invoke('resend-domains', {
+    body: { action: 'list' },
   });
-
   if (error) throw new Error(error.message);
   if (data?.error) throw new Error(data.error);
-
   return (data?.domains ?? []) as ResendDomain[];
 }
 
 export async function verifyResendDomain(domainId: string): Promise<ResendDomain> {
-  const { data, error } = await supabase.functions.invoke('resend-domains?action=verify', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ domainId }),
+  const { data, error } = await supabase.functions.invoke('resend-domains', {
+    body: { action: 'verify', domainId },
   });
-
   if (error) throw new Error(error.message);
   if (data?.error) throw new Error(data.error);
-
   return data.domain as ResendDomain;
 }
 
 export async function createResendDomain(name: string, region = 'us-east-1'): Promise<ResendDomain> {
-  const { data, error } = await supabase.functions.invoke('resend-domains?action=create', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, region }),
+  const { data, error } = await supabase.functions.invoke('resend-domains', {
+    body: { action: 'create', name, region },
   });
-
   if (error) throw new Error(error.message);
   if (data?.error) throw new Error(data.error);
-
   return data.domain as ResendDomain;
 }
 
 export async function deleteResendDomain(domainId: string): Promise<void> {
-  const { data, error } = await supabase.functions.invoke('resend-domains?action=delete', {
-    method: 'DELETE',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ domainId }),
+  const { data, error } = await supabase.functions.invoke('resend-domains', {
+    body: { action: 'delete', domainId },
   });
-
   if (error) throw new Error(error.message);
   if (data?.error) throw new Error(data.error);
 }

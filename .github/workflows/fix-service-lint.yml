@@ -1,0 +1,65 @@
+name: One-time service lint repair
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/fix-service-lint.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Apply exact service fixes
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/lib/services.ts')
+          s = p.read_text()
+          old = """export async function fetchTrendData(days = 30): Promise<DailyTrend[]> {
+            const { data, error } = await supabase.functions.invoke('resend-analytics');
+
+            if (error) throw new Error(error.message);
+            if (data?.error) throw new Error(data.error);
+
+            return (data?.trends ?? []) as DailyTrend[];
+          }"""
+          new = """export async function fetchTrendData(days = 30): Promise<DailyTrend[]> {
+            const { data, error } = await supabase.functions.invoke('resend-analytics');
+
+            if (error) throw new Error(error.message);
+            if (data?.error) throw new Error(data.error);
+
+            const trends = (data?.trends ?? []) as DailyTrend[];
+            return trends.slice(-Math.max(1, days));
+          }"""
+          if old not in s:
+              raise SystemExit('fetchTrendData source contract not found')
+          s = s.replace(old, new, 1)
+          old2 = """export async function fetchRecipientEmails(audienceType: string, segmentIds: string[]) {
+            let query = supabase.from('recipients').select('email').eq('status', 'active');"""
+          new2 = """export async function fetchRecipientEmails(audienceType: string, segmentIds: string[]) {
+            const query = supabase.from('recipients').select('email').eq('status', 'active');"""
+          if old2 not in s:
+              raise SystemExit('fetchRecipientEmails source contract not found')
+          s = s.replace(old2, new2, 1)
+          p.write_text(s)
+          PY
+
+      - name: Remove one-time workflow
+        run: rm .github/workflows/fix-service-lint.yml
+
+      - name: Commit repair
+        run: |
+          git config user.name "Earn Chat Release Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/lib/services.ts .github/workflows/fix-service-lint.yml
+          git commit -m "Fix service lint without rewriting module"
+          git push
